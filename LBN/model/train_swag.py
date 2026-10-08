@@ -1,8 +1,3 @@
-import os
-import json
-import copy
-
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -34,7 +29,7 @@ def train_epoch(
             label_noise: whether to add noise to the labels (dxb) for data augmentation (default: False)
 
         Returns: dict with keys 'train_loss' and 'reg_loss', each is a list of losses for each batch
-            train_losses: list of training losses for each batch
+            train_losses: list of total losses (data loss + regularization) for each batch
             reg_losses: list of regularization losses for each batch
     """
     if device is None:
@@ -104,7 +99,8 @@ def evaluate(
             model_type: 'drift' or 'diff'
             device: device to use for computation (default: 'cuda' if available)
         Returns:
-            val_loss: average validation loss
+            val_loss: squared error summed over output coordinates and divided by
+                the number of dataset samples (without time regularization)
     """
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'

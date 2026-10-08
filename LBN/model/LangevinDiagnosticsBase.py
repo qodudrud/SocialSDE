@@ -1,10 +1,6 @@
-from random import seed
-from statistics import mean
-
 import numpy as np
-import scipy
 import pandas as pd
-from scipy.stats import chi, chi2, norm
+from scipy.stats import chi2
 import math
 from tqdm import tqdm
 
@@ -169,7 +165,7 @@ def build_res_dataframe(
     include_distance=False
 ):
     """
-    Build a compact state-level dataframe for Seshat exogeneity analysis.
+    Build a compact state-level dataframe for exogeneity analysis.
 
     Row definition
     --------------
@@ -210,6 +206,9 @@ def build_res_dataframe(
     - bridge_gap_max_years:
         max of the previous and next gaps used by bridge/endpoint.
         Defined only for interior states.
+    - long_gap:
+        True when the incoming gap_years exceeds year_threshold; the
+        bridge_gap_max_years column is not used for this flag.
 
     Parameters
     ----------
@@ -473,11 +472,6 @@ def build_res_dataframe(
             # Long-gap flag:
             gap_for_flag = row["gap_years"]
             
-            # For bridge/endpoint rows, use bridge_gap_max_years.
-            # For initial/terminal rows, fall back to incoming gap_years.
-            # gap_for_flag = row["bridge_gap_max_years"]
-            # if not np.isfinite(gap_for_flag):
-            #     gap_for_flag = row["gap_years"]
 
             row["long_gap"] = (
                 False if year_threshold is None or not np.isfinite(gap_for_flag)
@@ -540,7 +534,7 @@ class LangevinDiagnosticsBase:
         self.include_time = getattr(args, 'include_time', False)
         self.time_reg_lambda = getattr(args, 'time_reg_lambda', 0.0)
 
-        # Move the models to the specified device for computation.
+        # Select the device used by diagnostics; subclasses handle their models.
         self.device = torch.device(
             device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")
         )
@@ -732,6 +726,8 @@ class LangevinDiagnosticsBase:
             D_raw ≈ E[Δx Δx^T | x] / (2 dt)
         to covariance diffusion
             D_cov ≈ Cov[Δx | x] / (2 dt).
+        This correction uses the common dt = self.time_step, not individual
+        transition intervals, and optionally adds eps to the diagonal.
         """
         dt = float(self.time_step)
 
@@ -748,16 +744,19 @@ class LangevinDiagnosticsBase:
 
     def return_drift_diff_estimate(self, xs, series_slices=None, n_MC=20, return_lists=False, return_cpu=False, adjust_for_drift=False):
         """
-            Helper function to return the averaged drift and diffusion estimates for the given trajectories.
-            Args:
-                xs: tensor of shape (N, input_dim) representing the states along the trajectories
-                dxs: tensor of shape (N, dim) representing the increments along the trajectories
-                dts: tensor of shape (N,) representing the time steps along the trajectories
-                series_slices: list of slices representing the indices of each trajectory in the concatenated tensors
-                n_MC: number of Monte Carlo samples to use for estimating mean and variance (default: 20)
-            Returns:
-                drift_est: tensor of shape (N, dim) representing the estimated drift at each state
-                diff_est: tensor of shape (N, dim, dim) representing the estimated diffusion matrix at each state
+        Return averaged drift and diffusion estimates at the supplied inputs.
+
+        Args:
+            xs: Full model inputs of shape (N, input_dim).
+            series_slices: Optional slices for per-trajectory outputs.
+            n_MC: Number of SWAG samples per fold for LBN evaluation.
+            return_lists: Add per-trajectory lists when series_slices is provided.
+            return_cpu: Detach and move estimates to CPU when True.
+            adjust_for_drift: Apply the finite-dt correction using self.time_step.
+        Returns:
+            Dictionary with drift_est (N, dim) and diff_est (N, dim, dim).
+            With return_lists=True and series_slices provided, also includes
+            drift_est_list and diff_est_list.
         """
         F_est = self.eval_field_mean_var(xs, n_MC=n_MC, model_type='drift', return_cpu=False)[0]
         D_est = self.eval_field_mean_var(xs, n_MC=n_MC, model_type='diff', return_cpu=False)[0]
@@ -832,9 +831,6 @@ class LangevinDiagnosticsBase:
             current_drift : torch.Tensor, shape [N, dim]
                 Current-form drift F - div_x D.
 
-            path_drift : torch.Tensor, shape [N, dim]
-                Alias of current_drift for use in path-irreversibility
-                calculations.
         """
         if pts.ndim != 2 or pts.shape[-1] != self.input_dim:
             raise ValueError(
@@ -1024,16 +1020,14 @@ class LangevinDiagnosticsBase:
             Random seed used for SWAG sampling.
 
         adjust_for_drift : bool
-            If True, convert the raw second-moment diffusion estimate to a
-            covariance diffusion estimate using the transition-specific dt:
+            If True, apply _correct_diffusion_for_finite_dt using the common
+            self.time_step, not transition-specific dts. The helper also adds
+            its default diagonal regularizer.
 
-                D_cov = D_raw - 0.5 F F^T dt.
-
-        jitter : float
-            Initial diagonal jitter used for Cholesky decomposition.
-
-        max_cholesky_tries : int
-            Maximum number of adaptive-jitter attempts.
+        Notes
+        -----
+        Transition log probabilities use a fixed internal Cholesky jitter of
+        1e-8. There is no adaptive-jitter retry or public jitter argument.
 
         Returns
         -------
@@ -1074,7 +1068,7 @@ class LangevinDiagnosticsBase:
 
         # --------------------------------------------------------------
         # 2. Evaluate F and D at both endpoints
-        # Concatenating start and endpoint inputs ensures that the same
+        # Concatenation evaluates both endpoints with the same sampled model weights.
         # --------------------------------------------------------------
         both_inputs = torch.cat([xs, x_next], dim=0)
 
@@ -1397,7 +1391,8 @@ class LangevinDiagnosticsBase:
                 seed: random seed for reproducibility (default: 42)
                 adjust_for_drift: whether to adjust for drift in noise calculation (default: False)
             Returns:
-                noises: tensor of shape (N, dim) representing the noise terms for each time step in the trajectories
+                Dictionary with noises: a detached CPU tensor of shape (N, dim).
+                If return_lists=True, also includes per-trajectory noises_list.
         """
         np.random.seed(seed)
         torch.manual_seed(seed)
@@ -1440,16 +1435,17 @@ class LangevinDiagnosticsBase:
     
     def _step_probabilities_from_noise(self, noise, series_slices, return_lists=True):
         """
-        Calculate step probabilities from the given noise.
+        Calculate chi-square tail probabilities from standardized noise.
         Args:
             noise: input noise (N, D)
             series_slices: list of slices representing the indices of each trajectory in the flattened noise tensor
-            return_lists: if True, also return lists of d2, p_step, s_step for each trajectory separately (default: True)
+            return_lists: if True, add trajectory-wise lists for each output (default: True)
         Returns:
             Dictionary containing:
-                - d2: squared Euclidean norm of the noise
-                - p_step: step probability
-                - s_step: negative log of step probability
+                - z2_step: element-wise squared standardized noise
+                - d2_step: squared Euclidean norm of the standardized noise
+                - p_step: chi-square survival probability at d2_step
+                - s_step: -log10(p_step)
         """
         z = np.asarray(noise, dtype=float)
         assert z.ndim == 2, "noise must be (N, D)"
@@ -1542,8 +1538,8 @@ class LangevinDiagnosticsBase:
             base_mid_inputs:[B, input_dim]
             adjust_for_drift: whether to adjust for drift in diffusion calculation (default: False)
         Returns:
-            Q_each: q1 + q2, [B]
-            phi_each: 0.5 * (q1 + q2 + log det Sigma_b_i), [B]
+            Dictionary with Q_each (q1 + q2) and phi_each
+            (0.5 * (q1 + q2 + log det Sigma_b_i)), each of shape [B].
         """
         B = x_states.shape[0]
         device = x_states.device
@@ -1797,9 +1793,8 @@ class LangevinDiagnosticsBase:
         """
         Batched bridge-based surprisal for interior observed states.
 
-        This implements option A:
-            collect all valid bridge points across all trajectories,
-            then optimize the Laplace mode in fixed-size mini-batches.
+        Collect valid bridge points across trajectories, then optimize the
+        Laplace mode in fixed-size mini-batches.
 
         For each valid index i:
             x_-       = xs[i-1]
@@ -1814,10 +1809,12 @@ class LangevinDiagnosticsBase:
         Mode:
             mu_i = argmin_x Phi_i(x)
 
-        Covariance:
-            cov_method='gauss_newton':
-                use _bridge_gauss_newton_cov_batch to compute the covariance at the mode.
-            other methods are not implemented yet but could be added in the future.
+        Score selected by Q_method:
+            'hvp': Hessian quadratic form at the optimized bridge mode.
+            'gauss_newton': quadratic form using Gauss-Newton precision.
+            'phi_diff': twice the objective difference between observation and mode.
+        The statistic is calibrated against a chi-square reference. Covariance
+        matrices are used internally for 'gauss_newton' but are not returned.
 
         Args:
             xs: [N, input_dim]
@@ -1836,12 +1833,15 @@ class LangevinDiagnosticsBase:
         Returns:
             result dict:
                 mu_bridge:      [N, dim]
-                Sigma_bridge:   [N, dim, dim]
                 d2_bridge:      [N]
                 p_bridge:       [N]
                 s_bridge:       [N]
-                valid_bridge:   [N]
+                valid_bridge:   [N], structural validity mask
+                valid_bridge_indices: flattened interior-state indices
+                Q_method: chosen scoring method
                 optionally trajectory-wise lists
+            Floating-point arrays use NaN outside valid indices. Tail scores
+            also remain NaN for non-finite or negative statistics.
         """
         assert init_mode in ['mf', 'obs'], "init_mode must be 'mf' or 'obs' (default: 'obs')"
         
@@ -1978,7 +1978,6 @@ class LangevinDiagnosticsBase:
         # 5. Batched covariance and tail probability
         # ------------------------------------------------------------------
         mu_flat_t = torch.full((N, self.dim), float('nan'), device=self.device, dtype=xs.dtype)
-        # Sigma_flat_t = torch.full((N, self.dim, self.dim), float('nan'), device=self.device, dtype=xs.dtype)
         d2_flat_t = torch.full((N,), float('nan'), device=self.device, dtype=xs.dtype)
         valid_flat_t = torch.zeros((N,), device=self.device, dtype=torch.bool)
 
@@ -2063,20 +2062,18 @@ class LangevinDiagnosticsBase:
                     d2_b = torch.clamp(d2_b, min=0.0)
 
             mu_flat_t[idx_b] = mu_b.detach()
-            # Sigma_flat_t[idx_b] = Sigma_brg_b.detach()
             d2_flat_t[idx_b] = d2_b.detach()
             valid_flat_t[idx_b] = True
 
         mu_flat = mu_flat_t.detach().cpu().numpy()
-        # Sigma_flat = Sigma_flat_t.detach().cpu().numpy()
         d2_flat = d2_flat_t.detach().cpu().numpy()
         valid_flat = valid_flat_t.detach().cpu().numpy()
 
         p_flat = np.full(N, np.nan, dtype=float)
         s_flat = np.full(N, np.nan, dtype=float)
 
-        # A bridge exists structurally, and its HVP statistic is valid
-        # for chi-square calibration.
+        # Calibrate only structurally valid bridges with finite, nonnegative
+        # statistics from the selected Q_method.
         score_valid = (
             valid_flat
             & np.isfinite(d2_flat)
@@ -2097,7 +2094,6 @@ class LangevinDiagnosticsBase:
         # ------------------------------------------------------------------
         result = {
             "mu_bridge": mu_flat,
-            # "Sigma_bridge": Sigma_flat,
             "d2_bridge": d2_flat,
             "p_bridge": p_flat,
             "s_bridge": s_flat,
@@ -2108,7 +2104,6 @@ class LangevinDiagnosticsBase:
 
         if return_lists:
             per_traj_mu = []
-            # per_traj_Sigma = []
             per_traj_d2 = []
             per_traj_p = []
             per_traj_s = []
@@ -2119,20 +2114,17 @@ class LangevinDiagnosticsBase:
 
                 if len(idx_range) == 0:
                     per_traj_mu.append(np.empty((0, self.dim)))
-                    # per_traj_Sigma.append(np.empty((0, self.dim, self.dim)))
                     per_traj_d2.append(np.empty((0,)))
                     per_traj_p.append(np.empty((0,)))
                     per_traj_s.append(np.empty((0,)))
                 else:
                     per_traj_mu.append(result["mu_bridge"][idx_range])
-                    # per_traj_Sigma.append(result["Sigma_bridge"][idx_range])
                     per_traj_d2.append(result["d2_bridge"][idx_range])
                     per_traj_p.append(result["p_bridge"][idx_range])
                     per_traj_s.append(result["s_bridge"][idx_range])
 
             result.update({
                 "mu_bridge_list": per_traj_mu,
-                # "Sigma_bridge_list": per_traj_Sigma,
                 "d2_bridge_list": per_traj_d2,
                 "p_bridge_list": per_traj_p,
                 "s_bridge_list": per_traj_s,
@@ -2855,304 +2847,3 @@ class LangevinDiagnosticsBase:
             })
 
         return result
-
-    
-    # # ==== Endpoint surprisal estimation using two-step optimization =====
-    # def calculate_endpoint_surprisal(
-    #     self,
-    #     xs,
-    #     dxs,
-    #     dts,
-    #     series_slices,
-    #     max_iter=50,
-    #     lr=5e-2,
-    #     loss_tol=1e-4,
-    #     init_mode='obs',
-    #     endpoint_batch_size=1024,
-    #     seed=42,
-    #     return_lists=True,
-    #     eps=1e-6,
-    #     adjust_for_drift=False,
-    #     verbose=True
-    # ):
-    #     """
-    #     Batched endpoint plausibility for two-step segments.
-
-    #     For each valid index i:
-    #         x_1  = xs[i-1]
-    #         z    = latent optimized intermediate state
-    #         x_3  = xs[i][state_slice] + dxs[i]
-    #         dt_1 = dts[i-1]
-    #         dt_2 = dts[i]
-
-    #     We compute
-
-    #         Q_endpoint(x_3 | x_1)
-    #             = min_z [q1(z) + q2(z)]
-
-    #     using _two_step_terms_from_precomputed(), where
-
-    #         q1 = (z - m_f)^T Sigma_f^{-1} (z - m_f)
-    #         q2 = r(z)^T Sigma_b(z)^{-1} r(z)
-
-    #     Then endpoint plausibility is defined as
-
-    #         p_endpoint = P(ChiSquare_dim >= Q_endpoint).
-
-    #     This is a chi-square-calibrated minimum-action endpoint plausibility,
-    #     not an exact finite-time transition probability.
-
-    #     Args:
-    #         xs: [N, input_dim]
-    #         dxs: [N, dim]
-    #         dts: [N] or [N, 1]
-    #         series_slices: list of slices
-    #         max_iter: Adam iterations
-    #         lr: Adam learning rate
-    #         loss_tol: relative loss-change tolerance
-    #         init_mode: 'mf' or 'obs'
-    #             'mf': initialize z at first-step predictive mean m_f
-    #             'obs': initialize z at observed midpoint xs[i]
-    #         endpoint_batch_size: batch size
-    #         seed: random seed
-    #         return_lists: whether to return trajectory-wise lists
-    #         eps: diagonal jitter
-    #         adjust_for_drift: whether to adjust for drift in endpoint calculation
-
-    #     Returns:
-    #         result dict:
-    #             z_endpoint:             [N, dim]
-    #             Q_endpoint:             [N]
-    #             p_endpoint:             [N]
-    #             s_endpoint:             [N]
-    #             valid_endpoint:         [N]
-    #             valid_endpoint_indices: [M]
-    #             optionally trajectory-wise lists
-    #     """
-    #     assert init_mode in ['mf', 'obs'], "init_mode must be 'mf' or 'obs'"
-
-    #     np.random.seed(seed)
-    #     torch.manual_seed(seed)
-        
-    #     xs, dxs, dts = self._prepare_transition_inputs(
-    #         xs,
-    #         dxs,
-    #         dts,
-    #     )
-    #     N = xs.shape[0]
-
-    #     state_sl = self._state_slice()
-
-    #     # ------------------------------------------------------------------
-    #     # 1. Build valid two-step indices
-    #     # ------------------------------------------------------------------
-    #     valid_indices = self._build_bridge_valid_indices(series_slices)
-
-    #     if len(valid_indices) == 0:
-    #         raise ValueError("No valid endpoint indices were found.")
-
-    #     valid_idx = torch.tensor(valid_indices, device=self.device, dtype=torch.long)
-    #     M = valid_idx.numel()
-
-    #     # ------------------------------------------------------------------
-    #     # 2. Build two-step contexts
-    #     # ------------------------------------------------------------------
-    #     x_prev_full_all = xs[valid_idx - 1].detach()
-    #     x_mid_full_all = xs[valid_idx].detach()
-    #     x_mid_obs_all = xs[valid_idx][:, state_sl].detach()
-    #     x_next_all = (xs[valid_idx][:, state_sl] + dxs[valid_idx]).detach()
-
-    #     dt_prev_all = dts[valid_idx - 1].detach()
-    #     dt_next_all = dts[valid_idx].detach()
-
-    #     # ------------------------------------------------------------------
-    #     # 3. Precompute first-step predictive distribution z | x_1
-    #     # ------------------------------------------------------------------
-    #     with torch.no_grad():
-    #         F_prev_all = self._eval_field_with_grad(
-    #             x_prev_full_all,
-    #             model_type='drift',
-    #         )
-
-    #         D_prev_all = self._eval_field_with_grad(
-    #             x_prev_full_all,
-    #             model_type='diff',
-    #         )
-    #         if adjust_for_drift:
-    #             D_prev_all = self._correct_diffusion_for_finite_dt(D_prev_all, F_prev_all)
-
-    #         x_prev_state_all = x_prev_full_all[:, state_sl]
-
-    #         m_f_all = x_prev_state_all + F_prev_all * dt_prev_all[:, None]
-    #         Sigma_f_all = 2.0 * D_prev_all * dt_prev_all[:, None, None]
-
-    #         I_all = torch.eye(
-    #             self.dim,
-    #             device=self.device,
-    #             dtype=Sigma_f_all.dtype,
-    #         ).unsqueeze(0)
-
-    #         Sigma_f_all = (
-    #             0.5 * (Sigma_f_all + Sigma_f_all.transpose(-1, -2))
-    #             + eps * I_all
-    #         )
-
-    #         m_f_all = m_f_all.detach()
-    #         Sigma_f_all = Sigma_f_all.detach()
-
-    #     # ------------------------------------------------------------------
-    #     # 4. Optimize latent intermediate z by minimizing Q_each
-    #     # ------------------------------------------------------------------
-    #     z_all = torch.empty((M, self.dim), device=self.device, dtype=xs.dtype)
-    #     Q_all = torch.empty((M,), device=self.device, dtype=xs.dtype)
-
-    #     for start in tqdm(
-    #         range(0, M, endpoint_batch_size),
-    #         desc="Batched endpoint plausibility optimization",
-    #     ):
-    #         end = min(start + endpoint_batch_size, M)
-
-    #         m_f_b = m_f_all[start:end]
-    #         Sigma_f_b = Sigma_f_all[start:end]
-    #         x_next_b = x_next_all[start:end]
-    #         dt_next_b = dt_next_all[start:end]
-    #         x_mid_full_b = x_mid_full_all[start:end]
-    #         x_mid_obs_b = x_mid_obs_all[start:end]
-
-    #         if init_mode == 'mf':
-    #             x0_b = m_f_b.detach().clone()
-    #         else:
-    #             x0_b = x_mid_obs_b.detach().clone()
-
-    #         with torch.enable_grad():
-    #             x_var = x0_b.detach().clone().requires_grad_(True)
-    #             optimizer = torch.optim.Adam([x_var], lr=lr)
-
-    #             prev_loss = None
-
-    #             loss_val_list = []
-    #             for it in range(max_iter):
-    #                 optimizer.zero_grad()
-
-    #                 terms = self._two_step_terms_from_precomputed(
-    #                     x_states=x_var,
-    #                     m_f=m_f_b,
-    #                     Sigma_f=Sigma_f_b,
-    #                     x_next_states=x_next_b,
-    #                     dt_next=dt_next_b,
-    #                     base_mid_inputs=x_mid_full_b,
-    #                     eps=eps,
-    #                     adjust_for_drift=adjust_for_drift,
-    #                 )
-
-    #                 Q_each = terms["Q_each"]
-    #                 loss = Q_each.mean()
-
-    #                 loss.backward()
-    #                 optimizer.step()
-
-    #                 loss_val = loss.detach()
-    #                 loss_val_list.append(loss_val.item())
-
-    #                 if prev_loss is not None:
-    #                     rel_change = torch.abs(prev_loss - loss_val) / (
-    #                         torch.abs(prev_loss) + 1e-12
-    #                     )
-    #                     if rel_change.item() < loss_tol:
-    #                         break
-
-    #                 prev_loss = loss_val
-                
-    #             if verbose:
-    #                 print(f"Stopping at iteration {it} with loss {loss_val.item():.6f} and initial_loss {loss_val_list[0]:.6f}")
-
-    #         # Recompute final terms at optimized z.
-    #         with torch.no_grad():
-    #             final_terms = self._two_step_terms_from_precomputed(
-    #                 x_states=x_var.detach(),
-    #                 m_f=m_f_b,
-    #                 Sigma_f=Sigma_f_b,
-    #                 x_next_states=x_next_b,
-    #                 dt_next=dt_next_b,
-    #                 base_mid_inputs=x_mid_full_b,
-    #                 eps=eps,
-    #                 adjust_for_drift=adjust_for_drift,
-    #             )
-
-    #         z_all[start:end] = x_var.detach()
-    #         Q_all[start:end] = final_terms["Q_each"].detach()
-
-    #     # ------------------------------------------------------------------
-    #     # 5. Scatter back to flattened arrays
-    #     # ------------------------------------------------------------------
-    #     z_flat_t = torch.full(
-    #         (N, self.dim),
-    #         float('nan'),
-    #         device=self.device,
-    #         dtype=xs.dtype,
-    #     )
-    #     Q_flat_t = torch.full((N,), float('nan'), device=self.device, dtype=xs.dtype)
-    #     valid_flat_t = torch.zeros((N,), device=self.device, dtype=torch.bool)
-
-    #     z_flat_t[valid_idx] = z_all
-    #     Q_flat_t[valid_idx] = Q_all
-    #     valid_flat_t[valid_idx] = True
-
-    #     z_flat = z_flat_t.detach().cpu().numpy()
-    #     Q_flat = Q_flat_t.detach().cpu().numpy()
-    #     valid_flat = valid_flat_t.detach().cpu().numpy()
-
-    #     # ------------------------------------------------------------------
-    #     # 6. Convert Q_endpoint to chi-square-calibrated tail probability
-    #     # ------------------------------------------------------------------
-    #     p_flat = np.full(N, np.nan, dtype=float)
-    #     s_flat = np.full(N, np.nan, dtype=float)
-
-    #     valid_Q = Q_flat[valid_flat]
-
-    #     p_valid = chi2.sf(valid_Q, df=self.dim)
-    #     p_valid = np.clip(p_valid, 1e-300, 1.0)
-
-    #     p_flat[valid_flat] = p_valid
-    #     s_flat[valid_flat] = -np.log10(p_valid)
-
-    #     # ------------------------------------------------------------------
-    #     # 7. Package result
-    #     # ------------------------------------------------------------------
-    #     result = {
-    #         "z_endpoint": z_flat,
-    #         "d2_endpoint": Q_flat,
-    #         "p_endpoint": p_flat,
-    #         "s_endpoint": s_flat,
-    #         "valid_endpoint": valid_flat,
-    #         "valid_endpoint_indices": np.array(valid_indices, dtype=int),
-    #     }
-
-    #     if return_lists:
-    #         per_traj_z = []
-    #         per_traj_Q = []
-    #         per_traj_p = []
-    #         per_traj_s = []
-
-    #         for s in series_slices:
-    #             idx_range = np.arange(s.start, s.stop, dtype=int)
-
-    #             if len(idx_range) == 0:
-    #                 per_traj_z.append(np.empty((0, self.dim)))
-    #                 per_traj_Q.append(np.empty((0,)))
-    #                 per_traj_p.append(np.empty((0,)))
-    #                 per_traj_s.append(np.empty((0,)))
-    #             else:
-    #                 per_traj_z.append(result["z_endpoint"][idx_range])
-    #                 per_traj_Q.append(result["d2_endpoint"][idx_range])
-    #                 per_traj_p.append(result["p_endpoint"][idx_range])
-    #                 per_traj_s.append(result["s_endpoint"][idx_range])
-
-    #         result.update({
-    #             "z_endpoint_list": per_traj_z,
-    #             "d2_endpoint_list": per_traj_Q,
-    #             "p_endpoint_list": per_traj_p,
-    #             "s_endpoint_list": per_traj_s,
-    #         })
-
-    #     return result

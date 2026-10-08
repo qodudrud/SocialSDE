@@ -61,7 +61,7 @@ class ConstantBasis:
 class PolynomialBasis:
     """Scalar monomials up to a chosen total degree.
 
-    Inputs are standardized using a weighted trajectory mean and standard
+    Inputs are standardized using a weighted sample mean and standard
     deviation by default. The reported coefficients therefore refer to the
     standardized monomials, while evaluation transparently accepts the original
     coordinates.
@@ -245,11 +245,12 @@ class Langevin_from_SFI(LangevinDiagnosticsBase):
     basis:
         Scalar basis library for the drift. It is replicated along each output
         coordinate, matching the vector basis used by PASTIS. By default a
-        standardized polynomial library is built from ``args.sfi_degree``
+        standardized polynomial library is built from ``args.sfi_drift_degree``
         (default 2).
     diffusion_basis:
-        Scalar library for the diffusion tensor. The default is constant. Pass
-        a polynomial or callable library for state-dependent diffusion.
+        Scalar library for the diffusion tensor. By default it is constant when
+        args.sfi_diffusion_degree is 0; a positive degree builds a polynomial
+        library. An explicit polynomial or callable library can also be supplied.
     feature_indices:
         Columns of the full ``xs`` tensor supplied to the drift basis. The
         default is the physical state block defined by ``_state_slice()``.
@@ -745,7 +746,6 @@ class Langevin_from_SFI(LangevinDiagnosticsBase):
         coefficients = self.diffusion_coefficients_.to(device=pts.device, dtype=pts.dtype)
         diffusion = torch.einsum("nk,kij->nij", psi, coefficients)
         return self._project_psd(diffusion)
-        # return diffusion
 
     def _drift_prediction_variance(self, pts: Tensor) -> Tensor:
         phi = self.basis(self._basis_input(pts, self.feature_indices))

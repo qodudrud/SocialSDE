@@ -1,20 +1,13 @@
-import math
 import copy
-import random
-import gc
 
 import argparse
 
 import os.path as path
-from collections import OrderedDict
 
 import numpy as np
-from scipy import stats
 import pandas as pd
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from LBN.model.train_swag import train_epoch, evaluate
 
 
@@ -95,7 +88,7 @@ def build_parser(
         default="./checkpoint",
         type=str,
         metavar="PATH",
-        help="path to save result (default: none)",
+        help="path to save result (default: ./checkpoint)",
     )
     parser.add_argument(
         "--output-path",
@@ -152,7 +145,7 @@ def build_parser(
         type=float,
         default=1e-4,
         metavar="LR",
-        help="learning rate (default: 1e-6)",
+        help="learning rate (default: 1e-4)",
     )
     parser.add_argument(
         "--lr-diff",
@@ -944,8 +937,14 @@ def acf_with_ci_irregular(
 
     Returns
     -------
+    dict
+        Keys below contain the returned tensors.
+
     acf : torch.Tensor, shape [K+1, D]
         Mean trajectory-level ACF/VACF.
+
+    se : torch.Tensor, shape [K+1, D]
+        Standard error across contributing trajectories.
 
     ci_lo : torch.Tensor, shape [K+1, D]
         Lower confidence interval.
@@ -1197,7 +1196,7 @@ def collect_swag_snapshots(
             weight_decay: L2 weight decay for parameters (except biases/norms)
             n_snaps: number of snapshot to collect
             burn_in_epochs: number of warmup epochs before taking snapshots
-            snap_every: take a snapshot every N epochs (implemented via loop length)
+            snap_every: snapshot after the first post-burn-in epoch, then every N epochs
             diff_tol: relative weight drift tolerance vs. initial weights to trigger LR decay
             start_from_swa_state: optional state_dict to initialize model
     """
@@ -1205,7 +1204,7 @@ def collect_swag_snapshots(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     epoch = 0
-    m, m2, t = None, None, 0  # running mean, squared mean, count for batch statistics
+    m, m2, t = None, None, 0  # Running parameter mean, second moment, and snapshot count.
     k_std = 2.5 
 
     model.to(device)
@@ -1232,7 +1231,7 @@ def collect_swag_snapshots(
         {"params": no_decay, "weight_decay": 0.0},
     ]
 
-    # fixed LR: no scheduler (to preserve stationarity)
+    # SGD without a scheduler; snapshot checks below can reduce the learning rate.
     optim = torch.optim.SGD(param_groups, lr=lr_swag, momentum=momentum, nesterov=True)
 
     snaps = []

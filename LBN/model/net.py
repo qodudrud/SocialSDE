@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import numpy as np
 
 import torch.nn.functional as F
 
@@ -187,7 +186,7 @@ class LBN_SWAG_Diff(nn.Module):
                     )
                 )
                         
-        # Output layer -> full matrix
+        # Output d*(d+1)/2 entries; SymmetricMap constructs the full matrix.
         self.output_layer = nn.Linear(self.n_hidden, n_out)
         self.sym_map = SymmetricMap(self.dim, ensure_psd=ensure_psd, eps=eps, use_softplus=use_softplus)
 
@@ -240,7 +239,8 @@ class LBN_SWAG_Diff(nn.Module):
 class SymmetricMap(nn.Module):
     """
         Map a d*(d+1)/2 vector to a symmetric matrix.
-        If ensure_psd=True, project to PSD by eigen-decomposition with softplus on eigenvalues.
+        If ensure_psd=True, transform eigenvalues with softplus + eps when
+        use_softplus=True, or clamp them to at least eps otherwise.
     """
     def __init__(self, dim: int, ensure_psd: bool = True, eps: float = 1e-9, use_softplus: bool = True):
         super().__init__()
@@ -282,4 +282,3 @@ class SymmetricMap(nn.Module):
                 print("raw S example:", S_psd[0])
                 print("====================================================")
         return S_psd
-

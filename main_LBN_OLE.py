@@ -2,27 +2,16 @@ import sys
 
 # OS
 import os
-import argparse, json, shutil
-import gc
-from argparse import Namespace
-import pickle
-from copy import deepcopy
-from tqdm import tqdm
+import json, shutil
 
 # mathematics
 import numpy as np
-import random, math
+import random
 
-# data handling
-from typing import List, Tuple, Optional, Sequence
-import pandas as pd
 
 # Torch
 import torch
-from torch.utils.data import Dataset, DataLoader, Subset
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.autograd import Variable
+from torch.utils.data import DataLoader
 
 # custom
 sys.path.append('LBN')
@@ -30,7 +19,7 @@ sys.path.append('LBN')
 from LBN.model.net import make_model
 from LBN.model.train_swag import train_epoch, evaluate
 from LBN.misc.loader import TrajectoryDataset, load_dataset, make_folds_kfold, dataset_to_langevin_data
-from LBN.misc.utils import save_checkpoint, type_or_none
+from LBN.misc.utils import save_checkpoint
 
 
 def main(args):
@@ -67,7 +56,7 @@ def main(args):
 
     # convert latent data to training data
 
-    ## For real-world data, we need to specify the id_col, state_cols, time_col, and time_unit in the arguments.
+    # Set column metadata for the supported dataset with an unrecognized filename.
     if data_content == 'unknown':
         if 'vdem_electoral_academ' in args.data:
             args.id_col = 'iso3'
@@ -94,7 +83,7 @@ def main(args):
     if args.include_time:
         args.n_cond_onehot -= 1
 
-    # cross-validation split (using name-wise K-fold)
+    # Shuffle transitions within each series into K folds (default split seed: 100).
     folds = make_folds_kfold(series_slices, K=args.n_folds)
 
     print(folds[args.cv_idx]['train_idx'][:10], folds[args.cv_idx]['valid_idx'][:10])

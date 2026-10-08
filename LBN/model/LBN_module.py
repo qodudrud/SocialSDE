@@ -1,15 +1,8 @@
-from random import seed
-from statistics import mean
-
 import numpy as np
-import scipy
-import pandas as pd
-from scipy.stats import chi, chi2, norm
 import math
 from tqdm import tqdm
 
 import torch
-from torch.linalg import cholesky as torch_cholesky
 
 
 from model.net import make_model
@@ -43,7 +36,7 @@ class Langevin_from_LBN(LangevinDiagnosticsBase):
         self.uct_abs_threshold = {'drift': None, 'diff': None}
         self.uct_rel_threshold = {'drift': None, 'diff': None}
 
-        # Set the number of folds based on the provided drift models.
+        # Use the drift model count, falling back to the diffusion model count.
         assert self.drift_models is not None or self.diff_models is not None, "At least one of drift_models or diff_models must be provided"
         self.n_folds = len(drift_models) if drift_models is not None else len(diff_models)
 
@@ -146,8 +139,8 @@ class Langevin_from_LBN(LangevinDiagnosticsBase):
         mean_output = mean_output.flatten(start_dim=1)  # [N, dim*dim] for diffusion or [N, dim] for drift
         var_output = var_output.flatten(start_dim=1).clamp_min(0.0)  # [N, dim*dim] for diffusion or [N, dim] for drift
 
-        uct_abs = torch.sqrt(torch.sum(var_output, dim=-1))  # [n_trajs]
-        uct_rel = uct_abs / (torch.norm(mean_output, dim=-1) + eps)  # relative uncertainty, [n_trajs]
+        uct_abs = torch.sqrt(torch.sum(var_output, dim=-1))  # [N]
+        uct_rel = uct_abs / (torch.norm(mean_output, dim=-1) + eps)  # relative uncertainty, [N]
 
         self.uct_abs_threshold[model_type] = torch.quantile(uct_abs, q)
         self.uct_rel_threshold[model_type] = torch.quantile(uct_rel, q)
@@ -157,16 +150,18 @@ class Langevin_from_LBN(LangevinDiagnosticsBase):
     # ===== SWAG inference (mean/var over samples) =====
     def eval_field_mean_var(self, pts, n_MC=20, model_type='drift', store_MC_outputs=False, return_cpu=False):
         """
-        Evaluate the mean and variance of the model output for the given input points using SWAG samples.
+        Evaluate output mean and variance across SWAG samples or saved model states.
         Args:
             pts: input points (N, input_dim)
-            n_MC: number of Monte Carlo samples to use for estimating mean and variance (default: 20)
+            n_MC: number of SWAG samples per fold (default: 20)
             model_type: 'drift' or 'diff' to specify which model to use for prediction (default: 'drift')
             store_MC_outputs: if True, store outputs from each MC sample for debugging/analysis (default: False)
-            return_cpu: if True, return mean and variance on CPU (default: True)
+            return_cpu: if True, return mean and variance on CPU (default: False)
         Returns:
             mean: mean (N, dim) if model_type=='drift' else (N, dim, dim) 
-            var: variance (N, dim) if model_type=='drift' else (N, dim, dim) 
+            var: variance (N, dim) if model_type=='drift' else (N, dim, dim)
+            outs_MC: additionally returned in SWAG mode with store_MC_outputs=True;
+                shape (n_folds, n_MC, N, dim) or (n_folds, n_MC, N, dim, dim).
         """
         assert model_type in ['drift', 'diff'], "model_type must be 'drift' or 'diff'"
 
@@ -280,14 +275,15 @@ class Langevin_from_LBN(LangevinDiagnosticsBase):
 
     def _build_state_update(self, state_update, cond_vec, n_trajs, dt):
         """
-        Helper function to build the state update by concatenating the conditional one-hot vector and time term if needed.
+        Build a full-input increment with zero increments for conditioning features
+        and an optional time increment dt.
         Args:
             state_update: tensor of shape (n_trajs, dim) representing the drift or diffusion term to be added to the state
             cond_vec: tensor of shape (n_trajs, n_cond_onehot) representing the conditional one-hot vector for each trajectory (if n_cond_onehot > 0)
             n_trajs: number of trajectories being simulated
             dt: time step for simulation (used if include_time is True)
         Returns:
-            state_update: tensor of shape (n_trajs, input_dim) representing the updated state update after concatenating conditional one-hot vector and time term if needed
+            state_update: full-input increment of shape (n_trajs, input_dim)
         """
         if self.n_cond_onehot > 0:
             zero_cond = torch.zeros_like(cond_vec)
@@ -319,7 +315,7 @@ class Langevin_from_LBN(LangevinDiagnosticsBase):
         Args:
             initial_points: tensor of shape (n_trajs, input_dim).
                 If include_time is True, the last component is the time coordinate.
-            n_steps: number of simulation steps.
+            n_steps: number of stored states, including the initial state; n_steps - 1 updates.
             seed: random seed for reproducibility.
             adjust_for_drift: if True, subtract the finite-time drift contribution
                 from diffusion. This is an optional finite-time second-moment correction.
@@ -327,7 +323,7 @@ class Langevin_from_LBN(LangevinDiagnosticsBase):
                 is too high or when Cholesky decomposition fails.
             use_relative_uncertainty: if True, relative uncertainty is also used as a
                 hard stopping criterion. Recommended default is False.
-            n_MC: number of SWAG samples per fold used in predict_mean_var.
+            n_MC: number of SWAG samples per fold used in eval_field_mean_var.
             jitter: diagonal jitter added before Cholesky decomposition.
             return_info: if True, return masks and stopping diagnostics.
 
